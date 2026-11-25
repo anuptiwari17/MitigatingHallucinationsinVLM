@@ -117,14 +117,25 @@ class ContrastiveDecisionLogitsProcessor(LogitsProcessor):
             gen_so_far = input_ids[:, self.prompt_len:]
             if gen_so_far.shape[1] > 0:
                 c_in = dict(self.contrast_inputs)
-                c_in["input_ids"] = torch.cat([self.contrast_inputs["input_ids"], gen_so_far], dim=1)
-                if "attention_mask" in self.contrast_inputs:
+                c_dev = self.contrast_inputs["input_ids"].device
+                gen_dev = gen_so_far.to(c_dev)
+                c_in["input_ids"] = torch.cat([self.contrast_inputs["input_ids"], gen_dev], dim=1)
+                if "attention_mask" in self.contrast_inputs and self.contrast_inputs["attention_mask"] is not None:
                     ones = torch.ones(
-                        (gen_so_far.shape[0], gen_so_far.shape[1]),
+                        (gen_dev.shape[0], gen_dev.shape[1]),
                         dtype=self.contrast_inputs["attention_mask"].dtype,
                         device=self.contrast_inputs["attention_mask"].device,
                     )
                     c_in["attention_mask"] = torch.cat([self.contrast_inputs["attention_mask"], ones], dim=1)
+                # Qwen3-VL includes mm_token_type_ids (0 = text token); extend with zeros to match new length
+                for type_key in ("mm_token_type_ids", "token_type_ids"):
+                    if type_key in self.contrast_inputs and self.contrast_inputs[type_key] is not None:
+                        zeros = torch.zeros(
+                            (gen_dev.shape[0], gen_dev.shape[1]),
+                            dtype=self.contrast_inputs[type_key].dtype,
+                            device=self.contrast_inputs[type_key].device,
+                        )
+                        c_in[type_key] = torch.cat([self.contrast_inputs[type_key], zeros], dim=1)
             else:
                 c_in = self.contrast_inputs
 
