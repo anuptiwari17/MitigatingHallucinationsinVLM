@@ -42,12 +42,21 @@ class QwenVLWrapper:
             min_pixels=min_pixels,
             max_pixels=max_pixels,
         )
-        self.model = AutoModelForImageTextToText.from_pretrained(
-            model_id,
-            torch_dtype=self.torch_dtype,
-            device_map="auto",
-            attn_implementation=self.attn_impl,
-        )
+        # Use modern `dtype=` kwarg (avoids transformers >=4.57 deprecation warning), fallback if older
+        try:
+            self.model = AutoModelForImageTextToText.from_pretrained(
+                model_id,
+                dtype=self.torch_dtype,
+                device_map="auto",
+                attn_implementation=self.attn_impl,
+            )
+        except TypeError:
+            self.model = AutoModelForImageTextToText.from_pretrained(
+                model_id,
+                torch_dtype=self.torch_dtype,
+                device_map="auto",
+                attn_implementation=self.attn_impl,
+            )
         self.model.eval()
         self.device = next(self.model.parameters()).device
 

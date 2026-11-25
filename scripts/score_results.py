@@ -27,8 +27,13 @@ def main():
     print(f"  aAcc (Overall)        : {summary['aAcc_overall']:.2f}%")
     print(f"  fAcc (Figure Consist.): {summary['fAcc_figure_consistency']:.2f}% ({summary['num_figures']} figures)")
     print(f"  qAcc (Question Pair)  : {summary['qAcc_question_pair']:.2f}% ({summary['num_question_pairs']} pairs)")
+    print(f"  Composite (a+f+q)/3   : {summary['composite_avg']:.2f}%")
     print(f"  Avg Latency           : {summary['avg_latency_sec']} sec/question")
     print(f"  Avg Entropy (Correct) : {summary['avg_entropy_correct']} | (Wrong): {summary['avg_entropy_wrong']}")
+    if summary["gate_triggered_count"] > 0:
+        print(f"  Gate Trigger Rate     : {summary['gate_trigger_rate_pct']:.2f}% ({summary['gate_triggered_count']} / {summary['total_questions']})")
+        print(f"  Flipped from Greedy   : {summary['flipped_from_greedy_count']}")
+        print(f"  Gate Reasons          : {summary['gate_reason_counts']}")
     print("\n  By Category:")
     for k, v in summary["by_category"].items():
         print(f"    {k:10s}: {v['acc']:6.2f}% (n={v['n']})")
