@@ -1,0 +1,79 @@
+{
+  "total_questions": 1129,
+  "unclear_predictions": 0,
+  "aAcc_overall": 69.35,
+  "fAcc_figure_consistency": 44.67,
+  "qAcc_question_pair": 38.68,
+  "composite_avg": 50.9,
+  "num_figures": 403,
+  "num_question_pairs": 455,
+  "by_category": {
+    "VD": {
+      "n": 591,
+      "acc": 65.31
+    },
+    "VS": {
+      "n": 538,
+      "acc": 73.79
+    }
+  },
+  "by_difficulty": {
+    "Easy": {
+      "n": 455,
+      "acc": 67.69
+    },
+    "Hard": {
+      "n": 674,
+      "acc": 70.47
+    }
+  },
+  "by_subcategory": {
+    "VD/figure": {
+      "n": 80,
+      "acc": 78.75
+    },
+    "VD/illusion": {
+      "n": 144,
+      "acc": 65.97
+    },
+    "VD/math": {
+      "n": 108,
+      "acc": 50.0
+    },
+    "VD/ocr": {
+      "n": 89,
+      "acc": 82.02
+    },
+    "VD/video": {
+      "n": 170,
+      "acc": 59.41
+    },
+    "VS/chart": {
+      "n": 206,
+      "acc": 73.3
+    },
+    "VS/map": {
+      "n": 96,
+      "acc": 70.83
+    },
+    "VS/ocr": {
+      "n": 81,
+      "acc": 69.14
+    },
+    "VS/table": {
+      "n": 155,
+      "acc": 78.71
+    }
+  },
+  "avg_latency_sec": 3.1795,
+  "avg_entropy_correct": 0.1241,
+  "avg_entropy_wrong": 0.2119,
+  "gate_trigger_rate_pct": 42.87,
+  "gate_triggered_count": 484,
+  "flipped_from_greedy_count": 52,
+  "gate_reason_counts": {
+    "entropy": 256,
+    "entropy+prior_dominance": 9,
+    "prior_dominance": 219
+  }
+}

@@ -13,10 +13,14 @@ from src.parser import parse_yes_no
 
 
 def _token_entropy(logits: torch.Tensor) -> float:
-    """Computes Shannon entropy (nats) of next-token probability distribution."""
+    """Computes Shannon entropy (nats) of next-token distribution, safely ignoring -inf masked entries."""
     logits_f = logits.float()
-    probs = F.softmax(logits_f, dim=-1)
-    log_probs = F.log_softmax(logits_f, dim=-1)
+    valid = torch.isfinite(logits_f)
+    if not valid.any():
+        return 0.0
+    logits_v = logits_f[valid]
+    probs = F.softmax(logits_v, dim=-1)
+    log_probs = F.log_softmax(logits_v, dim=-1)
     return float(-(probs * log_probs).sum(dim=-1).item())
 
 
@@ -113,7 +117,6 @@ class ContrastiveDecisionLogitsProcessor(LogitsProcessor):
         if self.step_idx == 0 and self.cached_step0_logits is not None:
             c_logits = self.cached_step0_logits.to(scores.device)
         else:
-            # Append already-generated tokens to the contrast stream so both streams stay aligned
             gen_so_far = input_ids[:, self.prompt_len:]
             if gen_so_far.shape[1] > 0:
                 c_in = dict(self.contrast_inputs)
@@ -127,7 +130,6 @@ class ContrastiveDecisionLogitsProcessor(LogitsProcessor):
                         device=self.contrast_inputs["attention_mask"].device,
                     )
                     c_in["attention_mask"] = torch.cat([self.contrast_inputs["attention_mask"], ones], dim=1)
-                # Qwen3-VL includes mm_token_type_ids (0 = text token); extend with zeros to match new length
                 for type_key in ("mm_token_type_ids", "token_type_ids"):
                     if type_key in self.contrast_inputs and self.contrast_inputs[type_key] is not None:
                         zeros = torch.zeros(
@@ -297,15 +299,16 @@ def run_selective_gate(
     tau_attn: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
-    Proposed Method (Phase 1): Conflict & Collapse-Gated Selective Steering.
+    Proposed Method (Selective Gate v2): Zero-Waste Prior-Agreement Selective Steering.
 
-    1. Runs normal greedy pass with image -> measures image entropy H_img (and optional L0-L5 visual attn).
-    2. Runs a ~30ms blind text-only 1-token prefill -> measures blind entropy H_text & KL(P_img || P_text).
-    3. Fires selective contrastive steering ONLY if:
-         - Alarm 1 (Uncertainty)    : H_img >= tau_ent
-         - Alarm 2 (Prior Dominance): H_text <= tau_blind_ent AND KL(P_img || P_text) <= tau_kl
-         - Alarm 3 (Attn Collapse)  : visual_attn_l0_5 <= tau_attn (when --log-attn & tau_attn set)
-    4. Otherwise returns the greedy answer immediately (preserving strong categories & saving latency).
+    1. Runs normal greedy pass with image -> measures image entropy H_img and top-2 plausibility.
+    2. Zero-waste check: if runner-up token is below beta * top1_prob (mathematically cannot flip
+       under adaptive plausibility masking), return greedy immediately (~0 overhead!).
+    3. When model is genuinely uncertain (H_img >= tau_ent, or optional L0-L5 attn <= tau_attn),
+       runs a ~30ms blind text-only prefill to check whether the hesitant image prediction
+       currently AGREES with the blind text prior (`argmax(P_img) == argmax(P_blind)`).
+    4. Fires contrastive prior subtraction ONLY when the hesitant model agrees with its blind prior
+       (if the image already overcame the blind prior, do not interfere!).
     """
     if image is None:
         return run_greedy(wrapper, question, image=None, max_new_tokens=max_new_tokens, log_attn=False)
@@ -324,47 +327,68 @@ def run_selective_gate(
     h_img = greedy_res["first_token_entropy"]
     v_attn = greedy_res["visual_attn_l0_5"]
 
-    # Fast ~30ms blind text-only prefill (no image tokens -> minimal compute)
-    inputs_blind = wrapper.build_inputs(question=question, image=None)
-    blind_out = wrapper.model(**inputs_blind, use_cache=False)
-    step0_blind_logits = blind_out.logits[:, -1, :]
-    h_blind = round(_token_entropy(step0_blind_logits[0]), 4)
-    kl_img_vs_text = round(_kl_divergence(step0_img_logits[0], step0_blind_logits[0]), 4) if step0_img_logits is not None else 0.0
+    # Zero-waste mathematical check: can a runner-up token survive beta * top1_prob?
+    runner_up_plausible = False
+    if step0_img_logits is not None:
+        top2 = F.softmax(step0_img_logits[0].float(), dim=-1).topk(2).values
+        runner_up_plausible = bool(top2[1].item() >= cd_beta * top2[0].item())
 
-    # Evaluate alarms
-    reasons: List[str] = []
-    if h_img is not None and h_img >= tau_ent:
-        reasons.append("entropy")
-    if h_blind <= tau_blind_ent and kl_img_vs_text <= tau_kl:
-        reasons.append("prior_dominance")
-    if tau_attn is not None and v_attn is not None and v_attn <= tau_attn:
-        reasons.append("attn_collapse")
+    attn_alarm = (tau_attn is not None and v_attn is not None and v_attn <= tau_attn)
+    ent_alarm = (h_img is not None and h_img >= tau_ent)
 
-    if not reasons:
+    if (not runner_up_plausible) or (not (ent_alarm or attn_alarm)):
         greedy_res["latency_sec"] = round(time.perf_counter() - t0, 4)
-        greedy_res["blind_entropy"] = h_blind
-        greedy_res["kl_img_vs_text"] = kl_img_vs_text
+        greedy_res["blind_entropy"] = None
+        greedy_res["kl_img_vs_text"] = None
+        greedy_res["top1_agrees_with_blind"] = None
         greedy_res["gate_triggered"] = False
         greedy_res["gate_reason"] = "none"
         greedy_res["flipped_from_greedy"] = False
         return greedy_res
 
-    # Alarm fired -> trigger selective contrastive steering
-    eff_alpha = alpha_prior if "prior_dominance" in reasons else cd_alpha
+    # Candidate is uncertain & plausible -> run ~30ms blindfold prefill to check prior agreement
+    inputs_blind = wrapper.build_inputs(question=question, image=None)
+    blind_out = wrapper.model(**inputs_blind, use_cache=False)
+    step0_blind_logits = blind_out.logits[:, -1, :]
+    h_blind = round(_token_entropy(step0_blind_logits[0]), 4)
+    kl_img_vs_text = round(_kl_divergence(step0_img_logits[0], step0_blind_logits[0]), 4)
+
+    top1_img = int(step0_img_logits[0].argmax(dim=-1).item())
+    top1_blind = int(step0_blind_logits[0].argmax(dim=-1).item())
+    agrees_with_blind = (top1_img == top1_blind)
+
+    # Prior-Agreement Filter: if the image ALREADY overcame the blind text prior, don't interfere!
+    if not agrees_with_blind:
+        greedy_res["latency_sec"] = round(time.perf_counter() - t0, 4)
+        greedy_res["blind_entropy"] = h_blind
+        greedy_res["kl_img_vs_text"] = kl_img_vs_text
+        greedy_res["top1_agrees_with_blind"] = False
+        greedy_res["gate_triggered"] = False
+        greedy_res["gate_reason"] = "skipped_prior_disagree"
+        greedy_res["flipped_from_greedy"] = False
+        return greedy_res
+
+    # Uncertain + Plausible + Leaning toward Blind Prior -> Trigger Selective Contrastive Steering!
+    reasons: List[str] = []
+    if ent_alarm:
+        reasons.append("entropy+prior_agree")
+    if attn_alarm:
+        reasons.append("attn_collapse")
+
     if contrast_source == "noisy":
         noisy_img = add_diffusion_noise(image, noise_step=vcd_noise_step, seed=42)
         c_inputs = wrapper.build_inputs(question=question, image=noisy_img)
         cached_c0 = None
     else:
         c_inputs = inputs_blind
-        cached_c0 = step0_blind_logits  # Reuse already-computed step-0 blind logits!
+        cached_c0 = step0_blind_logits
 
     prompt_len = inputs_clean["input_ids"].shape[1]
     proc = ContrastiveDecisionLogitsProcessor(
         model=wrapper.model,
         contrast_inputs=c_inputs,
         prompt_len=prompt_len,
-        alpha=eff_alpha,
+        alpha=cd_alpha,
         beta=cd_beta,
         contrast_steps=contrast_steps,
         cached_step0_logits=cached_c0,
@@ -392,6 +416,7 @@ def run_selective_gate(
         "first_token_entropy": h_img,
         "blind_entropy": h_blind,
         "kl_img_vs_text": kl_img_vs_text,
+        "top1_agrees_with_blind": True,
         "latency_sec": latency_sec,
         "visual_attn_l0_5": v_attn,
         "gate_triggered": True,
