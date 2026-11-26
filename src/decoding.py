@@ -61,12 +61,13 @@ def apply_contrastive_logits(
     logits_contrast: torch.Tensor,
     alpha: float = 1.0,
     beta: float = 0.1,
+    normalized_logprob: bool = False,
 ) -> torch.Tensor:
     """
-    VCD Adaptive Plausibility Constraint + Contrastive Logit Subtraction (Leng et al., CVPR 2024):
-      cd_logits = (1 + alpha) * logits_clean - alpha * logits_contrast
-      Mask out tokens whose clean probability < beta * max(clean_prob).
-    Works on shape [batch, vocab] or [vocab].
+    Contrastive logit adjustment with Adaptive Plausibility Constraint (APC):
+      - Raw VCD mode (normalized_logprob=False): (1 + alpha) * l_clean - alpha * l_contrast
+      - Normalized Log-Prob mode (normalized_logprob=True): log_p_clean - alpha * log_p_contrast
+        (prevents sharp blind-text logit magnitudes from blindly overpowering visual evidence).
     """
     clean_f = logits_clean.float()
     contrast_f = logits_contrast.float()
@@ -75,7 +76,12 @@ def apply_contrastive_logits(
     max_log_prob = log_probs_clean.max(dim=-1, keepdim=True).values
     cutoff = math.log(max(beta, 1e-8)) + max_log_prob
 
-    cd_logits = (1.0 + alpha) * clean_f - alpha * contrast_f
+    if normalized_logprob:
+        log_probs_contrast = F.log_softmax(contrast_f, dim=-1)
+        cd_logits = log_probs_clean - alpha * log_probs_contrast
+    else:
+        cd_logits = (1.0 + alpha) * clean_f - alpha * contrast_f
+
     masked = cd_logits.masked_fill(log_probs_clean < cutoff, float("-inf"))
     return masked.to(logits_clean.dtype)
 
@@ -85,8 +91,7 @@ class ContrastiveDecisionLogitsProcessor(LogitsProcessor):
     Version-safe LogitsProcessor for Qwen2.5-VL & Qwen3-VL.
     Lets Hugging Face's native `model.generate()` manage M-RoPE position_ids and KV-cache
     for the primary image stream, while injecting contrastive logits from a secondary
-    contrast stream (noisy image for VCD, or blind text-only for prior subtraction)
-    over the first `contrast_steps` decision tokens.
+    contrast stream over the first `contrast_steps` decision tokens.
     """
 
     def __init__(
@@ -98,6 +103,7 @@ class ContrastiveDecisionLogitsProcessor(LogitsProcessor):
         beta: float = 0.1,
         contrast_steps: int = 4,
         cached_step0_logits: Optional[torch.Tensor] = None,
+        normalized_logprob: bool = False,
     ):
         self.model = model
         self.contrast_inputs = contrast_inputs
@@ -106,6 +112,7 @@ class ContrastiveDecisionLogitsProcessor(LogitsProcessor):
         self.beta = beta
         self.contrast_steps = max(1, int(contrast_steps))
         self.cached_step0_logits = cached_step0_logits
+        self.normalized_logprob = normalized_logprob
         self.step_idx = 0
 
     @torch.inference_mode()
@@ -145,7 +152,13 @@ class ContrastiveDecisionLogitsProcessor(LogitsProcessor):
             c_logits = c_out.logits[:, -1, :].to(scores.device)
 
         self.step_idx += 1
-        return apply_contrastive_logits(scores, c_logits, alpha=self.alpha, beta=self.beta)
+        return apply_contrastive_logits(
+            scores,
+            c_logits,
+            alpha=self.alpha,
+            beta=self.beta,
+            normalized_logprob=self.normalized_logprob,
+        )
 
 
 def _extract_l0_5_visual_attn(
@@ -176,13 +189,17 @@ def run_greedy(
     max_new_tokens: int = 64,
     log_attn: bool = False,
     return_step0_logits: bool = False,
+    max_pixels_override: Optional[int] = None,
+    upscale_to_cap: bool = False,
 ) -> Dict[str, Any]:
-    """
-    Standard greedy baseline. Logs first-token entropy, latency,
-    and optionally L0-L5 visual-token attention mass.
-    """
+    """Standard greedy baseline. Logs first-token entropy, latency, and optional L0-L5 visual attn."""
     t0 = time.perf_counter()
-    inputs = wrapper.build_inputs(question=question, image=image)
+    inputs = wrapper.build_inputs(
+        question=question,
+        image=image,
+        max_pixels_override=max_pixels_override,
+        upscale_to_cap=upscale_to_cap,
+    )
     prompt_len = inputs["input_ids"].shape[1]
 
     gen_out = wrapper.model.generate(
@@ -230,10 +247,7 @@ def run_vcd(
     vcd_noise_step: int = 500,
     contrast_steps: int = 4,
 ) -> Dict[str, Any]:
-    """
-    Always-On Visual Contrastive Decoding baseline (Leng et al., CVPR 2024).
-    Falls back cleanly to greedy on text-only rows (image is None).
-    """
+    """Always-On Visual Contrastive Decoding baseline (Leng et al., CVPR 2024)."""
     if image is None:
         return run_greedy(wrapper, question, image=None, max_new_tokens=max_new_tokens, log_attn=False)
 
@@ -289,27 +303,13 @@ def run_selective_gate(
     log_attn: bool = False,
     cd_alpha: float = 1.0,
     cd_beta: float = 0.1,
-    alpha_prior: float = 1.2,
     vcd_noise_step: int = 500,
     contrast_steps: int = 4,
     contrast_source: str = "text",
     tau_ent: float = 0.15,
-    tau_blind_ent: float = 0.15,
-    tau_kl: float = 0.10,
     tau_attn: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """
-    Proposed Method (Selective Gate v2): Zero-Waste Prior-Agreement Selective Steering.
-
-    1. Runs normal greedy pass with image -> measures image entropy H_img and top-2 plausibility.
-    2. Zero-waste check: if runner-up token is below beta * top1_prob (mathematically cannot flip
-       under adaptive plausibility masking), return greedy immediately (~0 overhead!).
-    3. When model is genuinely uncertain (H_img >= tau_ent, or optional L0-L5 attn <= tau_attn),
-       runs a ~30ms blind text-only prefill to check whether the hesitant image prediction
-       currently AGREES with the blind text prior (`argmax(P_img) == argmax(P_blind)`).
-    4. Fires contrastive prior subtraction ONLY when the hesitant model agrees with its blind prior
-       (if the image already overcame the blind prior, do not interfere!).
-    """
+    """Selective Gate v2: Zero-Waste Prior-Agreement Selective Steering."""
     if image is None:
         return run_greedy(wrapper, question, image=None, max_new_tokens=max_new_tokens, log_attn=False)
 
@@ -327,7 +327,6 @@ def run_selective_gate(
     h_img = greedy_res["first_token_entropy"]
     v_attn = greedy_res["visual_attn_l0_5"]
 
-    # Zero-waste mathematical check: can a runner-up token survive beta * top1_prob?
     runner_up_plausible = False
     if step0_img_logits is not None:
         top2 = F.softmax(step0_img_logits[0].float(), dim=-1).topk(2).values
@@ -346,7 +345,6 @@ def run_selective_gate(
         greedy_res["flipped_from_greedy"] = False
         return greedy_res
 
-    # Candidate is uncertain & plausible -> run ~30ms blindfold prefill to check prior agreement
     inputs_blind = wrapper.build_inputs(question=question, image=None)
     blind_out = wrapper.model(**inputs_blind, use_cache=False)
     step0_blind_logits = blind_out.logits[:, -1, :]
@@ -355,10 +353,7 @@ def run_selective_gate(
 
     top1_img = int(step0_img_logits[0].argmax(dim=-1).item())
     top1_blind = int(step0_blind_logits[0].argmax(dim=-1).item())
-    agrees_with_blind = (top1_img == top1_blind)
-
-    # Prior-Agreement Filter: if the image ALREADY overcame the blind text prior, don't interfere!
-    if not agrees_with_blind:
+    if top1_img != top1_blind:
         greedy_res["latency_sec"] = round(time.perf_counter() - t0, 4)
         greedy_res["blind_entropy"] = h_blind
         greedy_res["kl_img_vs_text"] = kl_img_vs_text
@@ -368,8 +363,7 @@ def run_selective_gate(
         greedy_res["flipped_from_greedy"] = False
         return greedy_res
 
-    # Uncertain + Plausible + Leaning toward Blind Prior -> Trigger Selective Contrastive Steering!
-    reasons: List[str] = []
+    reasons = []
     if ent_alarm:
         reasons.append("entropy+prior_agree")
     if attn_alarm:
@@ -424,6 +418,145 @@ def run_selective_gate(
     }
 
 
+@torch.inference_mode()
+def run_selective_zoom(
+    wrapper: QwenVLWrapper,
+    question: str,
+    image: Optional[Any],
+    max_new_tokens: int = 64,
+    log_attn: bool = False,
+    zoom_max_pixels: int = 1280 * 28 * 28,
+    zoom_alpha: float = 0.30,
+    cd_beta: float = 0.1,
+    contrast_steps: int = 4,
+    tau_ent: float = 0.15,
+    tau_attn: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Proposed Method (Selective Gate v3): Entropy-Gated Adaptive Visual Zoom + Normalized Prior Calibration.
+
+    1. Fast Pass 1 (standard resolution): measures image entropy H_img and top-2 plausibility.
+    2. If confident (H_img < tau_ent or runner-up implausible): stop immediately (~0 overhead!).
+    3. If genuinely uncertain (~3%-15% of questions):
+       a) Adaptive High-Res Visual Zoom: re-encodes the image at 2.5x visual token budget
+          (`zoom_max_pixels = 1280*28*28`, gentle LANCZOS upscale up to 2x for smaller images)
+          so the ViT actually gets sharper visual evidence for tiny objects/charts/maps.
+       b) Gentle Normalized Prior Calibration: runs ~30ms blindfold pass; ONLY if the zoomed
+          view still agrees with the blind prior AND remains somewhat uncertain, applies mild
+          log-probability subtraction (`log_p_zoom - zoom_alpha * log_p_blind`, default alpha=0.30)
+          so high-res vision stays in charge while weak blind biases are removed.
+    """
+    if image is None:
+        return run_greedy(wrapper, question, image=None, max_new_tokens=max_new_tokens, log_attn=False)
+
+    t0 = time.perf_counter()
+    greedy_res = run_greedy(
+        wrapper,
+        question=question,
+        image=image,
+        max_new_tokens=max_new_tokens,
+        log_attn=log_attn,
+        return_step0_logits=True,
+    )
+    step0_img_logits = greedy_res.pop("_step0_logits")
+    greedy_res.pop("_inputs")
+    h_img = greedy_res["first_token_entropy"]
+    v_attn = greedy_res["visual_attn_l0_5"]
+
+    runner_up_plausible = False
+    if step0_img_logits is not None:
+        top2 = F.softmax(step0_img_logits[0].float(), dim=-1).topk(2).values
+        runner_up_plausible = bool(top2[1].item() >= cd_beta * top2[0].item())
+
+    attn_alarm = (tau_attn is not None and v_attn is not None and v_attn <= tau_attn)
+    ent_alarm = (h_img is not None and h_img >= tau_ent)
+
+    if (not runner_up_plausible) or (not (ent_alarm or attn_alarm)):
+        greedy_res["latency_sec"] = round(time.perf_counter() - t0, 4)
+        greedy_res["zoom_entropy"] = None
+        greedy_res["blind_entropy"] = None
+        greedy_res["gate_triggered"] = False
+        greedy_res["gate_reason"] = "none"
+        greedy_res["flipped_from_greedy"] = False
+        return greedy_res
+
+    # Step 3a: Adaptive High-Res Visual Zoom
+    inputs_zoom = wrapper.build_inputs(
+        question=question,
+        image=image,
+        max_pixels_override=zoom_max_pixels,
+        upscale_to_cap=True,
+    )
+    zoom_prefill = wrapper.model(**inputs_zoom, use_cache=False)
+    step0_zoom_logits = zoom_prefill.logits[:, -1, :]
+    h_zoom = round(_token_entropy(step0_zoom_logits[0]), 4)
+
+    # Step 3b: Fast ~30ms blindfold prefill
+    inputs_blind = wrapper.build_inputs(question=question, image=None)
+    blind_out = wrapper.model(**inputs_blind, use_cache=False)
+    step0_blind_logits = blind_out.logits[:, -1, :]
+    h_blind = round(_token_entropy(step0_blind_logits[0]), 4)
+    kl_zoom_vs_text = round(_kl_divergence(step0_zoom_logits[0], step0_blind_logits[0]), 4)
+
+    top1_zoom = int(step0_zoom_logits[0].argmax(dim=-1).item())
+    top1_blind = int(step0_blind_logits[0].argmax(dim=-1).item())
+    agrees_with_blind = (top1_zoom == top1_blind)
+
+    prompt_len = inputs_zoom["input_ids"].shape[1]
+
+    # Only apply gentle normalized prior calibration if the zoomed view STILL agrees with blind prior
+    if agrees_with_blind and zoom_alpha > 0.0:
+        proc = ContrastiveDecisionLogitsProcessor(
+            model=wrapper.model,
+            contrast_inputs=inputs_blind,
+            prompt_len=prompt_len,
+            alpha=zoom_alpha,
+            beta=cd_beta,
+            contrast_steps=contrast_steps,
+            cached_step0_logits=step0_blind_logits,
+            normalized_logprob=True,
+        )
+        gen_out = wrapper.model.generate(
+            **inputs_zoom,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            logits_processor=LogitsProcessorList([proc]),
+            return_dict_in_generate=True,
+            output_scores=True,
+        )
+        reason = "zoom+norm_prior"
+    else:
+        gen_out = wrapper.model.generate(
+            **inputs_zoom,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            return_dict_in_generate=True,
+            output_scores=True,
+        )
+        reason = "zoom_only"
+
+    latency_sec = round(time.perf_counter() - t0, 4)
+    new_tokens = gen_out.sequences[0][prompt_len:]
+    raw_output = wrapper.processor.decode(new_tokens, skip_special_tokens=True).strip()
+    pred_binary = parse_yes_no(raw_output)
+
+    return {
+        "raw_output": raw_output,
+        "pred_binary": pred_binary,
+        "greedy_pred_binary": greedy_res["pred_binary"],
+        "flipped_from_greedy": (pred_binary != greedy_res["pred_binary"]),
+        "first_token_entropy": h_img,
+        "zoom_entropy": h_zoom,
+        "blind_entropy": h_blind,
+        "kl_img_vs_text": kl_zoom_vs_text,
+        "top1_agrees_with_blind": agrees_with_blind,
+        "latency_sec": latency_sec,
+        "visual_attn_l0_5": v_attn,
+        "gate_triggered": True,
+        "gate_reason": reason,
+    }
+
+
 def run_decoding(
     method: str,
     wrapper: QwenVLWrapper,
@@ -433,7 +566,7 @@ def run_decoding(
     log_attn: bool = False,
     **kwargs,
 ) -> Dict[str, Any]:
-    """Pluggable decoding dispatcher: greedy | vcd | selective_gate."""
+    """Pluggable decoding dispatcher: greedy | vcd | selective_gate | selective_zoom."""
     m = method.lower().strip()
     if m == "greedy":
         return run_greedy(wrapper, question, image, max_new_tokens=max_new_tokens, log_attn=log_attn)
@@ -458,13 +591,24 @@ def run_decoding(
             log_attn=log_attn,
             cd_alpha=kwargs.get("cd_alpha", 1.0),
             cd_beta=kwargs.get("cd_beta", 0.1),
-            alpha_prior=kwargs.get("alpha_prior", 1.2),
             vcd_noise_step=kwargs.get("vcd_noise_step", 500),
             contrast_steps=kwargs.get("contrast_steps", 4),
             contrast_source=kwargs.get("contrast_source", "text"),
             tau_ent=kwargs.get("tau_ent", 0.15),
-            tau_blind_ent=kwargs.get("tau_blind_ent", 0.15),
-            tau_kl=kwargs.get("tau_kl", 0.10),
+            tau_attn=kwargs.get("tau_attn", None),
+        )
+    if m == "selective_zoom":
+        return run_selective_zoom(
+            wrapper,
+            question,
+            image,
+            max_new_tokens=max_new_tokens,
+            log_attn=log_attn,
+            zoom_max_pixels=kwargs.get("zoom_max_pixels", 1280 * 28 * 28),
+            zoom_alpha=kwargs.get("zoom_alpha", 0.30),
+            cd_beta=kwargs.get("cd_beta", 0.1),
+            contrast_steps=kwargs.get("contrast_steps", 4),
+            tau_ent=kwargs.get("tau_ent", 0.15),
             tau_attn=kwargs.get("tau_attn", None),
         )
     raise ValueError(f"Unknown decoding method: {method}")

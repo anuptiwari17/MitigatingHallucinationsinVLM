@@ -27,39 +27,41 @@ def load_completed_uids(jsonl_path: str) -> set:
     return done
 
 
-def parse_args() -> EvalConfig:
+def parse_args():
     p = argparse.ArgumentParser(description="Modular, resume-safe VLM hallucination benchmark runner.")
     p.add_argument("--model", default="Qwen/Qwen3-VL-4B-Instruct", help="Hugging Face model ID")
-    p.add_argument("--benchmark", default="hallusionbench", help="Benchmark name (hallusionbench)")
-    p.add_argument("--method", default="greedy", choices=["greedy", "vcd", "selective_gate"], help="Decoding method")
+    p.add_argument("--benchmark", default="hallusionbench", help="Benchmark name (hallusionbench | pope_adv | pope_popular | pope_random)")
+    p.add_argument("--method", default="greedy", choices=["greedy", "vcd", "selective_gate", "selective_zoom"], help="Decoding method")
     p.add_argument("--dtype", default="auto", choices=["auto", "fp16", "bf16"], help="Model precision")
-    p.add_argument("--max-pixels", type=int, default=512 * 28 * 28, help="Max image pixels cap (prevents T4 OOM)")
+    p.add_argument("--max-pixels", type=int, default=512 * 28 * 28, help="Base max image pixels cap")
     p.add_argument("--max-new-tokens", type=int, default=64, help="Max generated tokens per question")
     p.add_argument("--log-attn", action="store_true", help="Log L0-L5 visual attention (uses eager attn)")
-    p.add_argument("--limit", type=int, default=None, help="Optional row cap for quick smoke test (e.g., 50)")
+    p.add_argument("--limit", type=int, default=None, help="Optional row cap for quick smoke/dev test")
     p.add_argument("--output", required=True, help="Output JSONL path (auto-resumes if file exists)")
 
     # 2-GPU parallel sharding
     p.add_argument("--shard-idx", type=int, default=0, help="Shard index (0..num_shards-1)")
-    p.add_argument("--num-shards", type=int, default=1, help="Total parallel shards (e.g. 2 for 2x T4 on 4B)")
+    p.add_argument("--num-shards", type=int, default=1, help="Total parallel shards")
 
-    # VCD & Selective Gate knobs
-    p.add_argument("--cd-alpha", type=float, default=1.0, help="Contrastive subtraction weight alpha")
-    p.add_argument("--cd-beta", type=float, default=0.1, help="VCD adaptive plausibility cutoff beta")
+    # VCD & Selective Gate v2/v3 knobs
+    p.add_argument("--cd-alpha", type=float, default=1.0, help="VCD / v2 contrastive weight alpha")
+    p.add_argument("--cd-beta", type=float, default=0.1, help="Adaptive plausibility cutoff beta")
     p.add_argument("--vcd-noise-step", type=int, default=500, help="Gaussian diffusion noise step (0..999)")
-    p.add_argument("--contrast-steps", type=int, default=4, help="Decision-window tokens steered by contrastive logits")
-    p.add_argument("--contrast-source", default="text", choices=["text", "noisy"], help="Selective gate contrast pass")
-    p.add_argument("--tau-ent", type=float, default=0.15, help="Alarm 1: image entropy threshold")
-    p.add_argument("--tau-blind-ent", type=float, default=0.15, help="Alarm 2a: blind text entropy threshold")
-    p.add_argument("--tau-kl", type=float, default=0.10, help="Alarm 2b: KL(P_img || P_text) threshold")
-    p.add_argument("--tau-attn", type=float, default=None, help="Alarm 3 (optional): L0-L5 visual attn threshold")
-    p.add_argument("--alpha-prior", type=float, default=1.2, help="Alpha when prior-dominance alarm fires")
+    p.add_argument("--contrast-steps", type=int, default=4, help="Decision-window tokens steered")
+    p.add_argument("--contrast-source", default="text", choices=["text", "noisy"], help="v2 contrast source")
+    p.add_argument("--tau-ent", type=float, default=0.15, help="Image entropy gate threshold")
+    p.add_argument("--tau-blind-ent", type=float, default=0.15, help="(Unused in v2/v3; kept for CLI compatibility)")
+    p.add_argument("--tau-kl", type=float, default=0.10, help="(Unused in v2/v3; kept for CLI compatibility)")
+    p.add_argument("--tau-attn", type=float, default=None, help="Optional L0-L5 visual attn threshold")
+    p.add_argument("--alpha-prior", type=float, default=1.2, help="(Kept for CLI compatibility)")
+    p.add_argument("--zoom-max-pixels", type=int, default=1280 * 28 * 28, help="v3 high-res visual zoom cap")
+    p.add_argument("--zoom-alpha", type=float, default=0.30, help="v3 normalized log-prob prior calibration weight")
 
     args = p.parse_args()
     if args.num_shards < 1 or not (0 <= args.shard_idx < args.num_shards):
         raise ValueError(f"Invalid shard settings: shard_idx={args.shard_idx}, num_shards={args.num_shards}")
 
-    return EvalConfig(
+    cfg = EvalConfig(
         model_id=args.model,
         benchmark=args.benchmark,
         method=args.method,
@@ -82,10 +84,11 @@ def parse_args() -> EvalConfig:
         tau_attn=args.tau_attn,
         alpha_prior=args.alpha_prior,
     )
+    return cfg, args.zoom_max_pixels, args.zoom_alpha
 
 
 def main():
-    cfg = parse_args()
+    cfg, zoom_max_pixels, zoom_alpha = parse_args()
     os.makedirs(os.path.dirname(os.path.abspath(cfg.output_path)), exist_ok=True)
 
     examples = load_benchmark(cfg.benchmark, limit=cfg.limit)
@@ -117,10 +120,9 @@ def main():
         contrast_steps=cfg.contrast_steps,
         contrast_source=cfg.contrast_source,
         tau_ent=cfg.tau_ent,
-        tau_blind_ent=cfg.tau_blind_ent,
-        tau_kl=cfg.tau_kl,
         tau_attn=cfg.tau_attn,
-        alpha_prior=cfg.alpha_prior,
+        zoom_max_pixels=zoom_max_pixels,
+        zoom_alpha=zoom_alpha,
     )
 
     with open(cfg.output_path, "a", encoding="utf-8") as fout:

@@ -1,5 +1,7 @@
+import math
 from typing import Dict, Any, Optional, Tuple
 import torch
+from PIL import Image
 from transformers import AutoProcessor, AutoModelForImageTextToText
 
 
@@ -18,7 +20,7 @@ def resolve_dtype(dtype_name: str) -> torch.dtype:
 class QwenVLWrapper:
     """
     Hardware-portable wrapper for Qwen3-VL and Qwen2.5-VL models.
-    Works across Kaggle (2x T4), Google Colab (T4/L4/A100), and single college GPUs.
+    Supports dynamic per-call resolution override (Adaptive High-Res Visual Zoom for Selective Gate v3).
     """
 
     def __init__(
@@ -32,9 +34,10 @@ class QwenVLWrapper:
     ):
         self.model_id = model_id
         self.torch_dtype = resolve_dtype(dtype)
-        # Eager attention is required to read raw attention matrices for L0-L5 probing
         self.attn_impl = "eager" if log_attn else attn_implementation
         self.log_attn = log_attn
+        self.min_pixels = min_pixels
+        self.max_pixels = max_pixels
 
         print(f"Loading {model_id} | dtype={self.torch_dtype} | attn={self.attn_impl}...")
         self.processor = AutoProcessor.from_pretrained(
@@ -42,7 +45,6 @@ class QwenVLWrapper:
             min_pixels=min_pixels,
             max_pixels=max_pixels,
         )
-        # Use modern `dtype=` kwarg (avoids transformers >=4.57 deprecation warning), fallback if older
         try:
             self.model = AutoModelForImageTextToText.from_pretrained(
                 model_id,
@@ -60,11 +62,34 @@ class QwenVLWrapper:
         self.model.eval()
         self.device = next(self.model.parameters()).device
 
-    def build_inputs(self, question: str, image: Optional[Any] = None) -> Dict[str, torch.Tensor]:
-        """Builds model inputs cleanly for both image+text and text-only control rows."""
+    def _set_processor_max_pixels(self, max_px: int):
+        ip = getattr(self.processor, "image_processor", None)
+        if ip is None:
+            return
+        if hasattr(ip, "max_pixels"):
+            ip.max_pixels = max_px
+        if hasattr(ip, "size") and isinstance(ip.size, dict) and "longest_edge" in ip.size:
+            ip.size["longest_edge"] = max_px
+
+    def build_inputs(
+        self,
+        question: str,
+        image: Optional[Any] = None,
+        max_pixels_override: Optional[int] = None,
+        upscale_to_cap: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        """Builds model inputs cleanly for image+text, high-res zoomed image+text, or text-only."""
         if image is not None:
             if image.mode != "RGB":
                 image = image.convert("RGB")
+            if upscale_to_cap and max_pixels_override is not None:
+                w, h = image.size
+                cur_px = max(1, w * h)
+                if cur_px < max_pixels_override:
+                    scale = min(2.0, math.sqrt(max_pixels_override / cur_px))
+                    new_w = max(28, int(round(w * scale)))
+                    new_h = max(28, int(round(h * scale)))
+                    image = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
             messages = [
                 {
                     "role": "user",
@@ -82,20 +107,24 @@ class QwenVLWrapper:
                 }
             ]
 
-        inputs = self.processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
-        )
+        if max_pixels_override is not None:
+            self._set_processor_max_pixels(max_pixels_override)
+        try:
+            inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+        finally:
+            if max_pixels_override is not None:
+                self._set_processor_max_pixels(self.max_pixels)
+
         return {k: v.to(self.device) if hasattr(v, "to") else v for k, v in inputs.items()}
 
     def find_vision_token_span(self, input_ids: torch.Tensor) -> Optional[Tuple[int, int]]:
-        """
-        Locates [start, end) indices of visual tokens in Qwen2.5-VL / Qwen3-VL prompts.
-        Used in Phase 1 Attention-Collapse Probing & Selective Gate.
-        """
+        """Locates [start, end) indices of visual tokens in Qwen2.5-VL / Qwen3-VL prompts."""
         tok = self.processor.tokenizer
         start_id = tok.convert_tokens_to_ids("<|vision_start|>")
         end_id = tok.convert_tokens_to_ids("<|vision_end|>")
